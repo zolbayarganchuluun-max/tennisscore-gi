@@ -1,18 +1,14 @@
 /**
  * Tennis data access layer.
  *
- * This module is the single seam between the UI and whatever real tennis
- * feed you plug in later (RapidAPI "Tennis Live Data", Sportmonks, etc.).
- * The UI never imports the mock arrays directly anymore — it calls
+ * Single seam between the UI and the real feed. The UI calls
  * `fetchTennisData()` / `fetchLiveData()` and receives already-normalised
- * `Match` / `LiveMatch` / `ResultMatch` objects.
+ * `Tournament<...>` objects grouped for the Live / Pre-match / Results tabs.
  *
- * To go live:
- *   1. Implement `mapProviderResponse()` for your provider's JSON shape.
- *   2. Replace the mock bodies of the `fetch*` functions with real `fetch()`
- *      calls (ideally proxied through a Next.js route handler so the API key
- *      stays server-side), then run the result through `mapProviderResponse`.
- * The React hooks and every component keep working unchanged.
+ * Live provider: RapidAPI "Tennis API (ATP, WTA, ITF)" (MatchStat), proxied
+ * through the server route `app/api/matches/route.ts` so the key stays private.
+ * If the feed is unreachable or returns nothing, we transparently fall back to
+ * the bundled mock data so the dashboard is never blank in the preview.
  */
 
 import {
@@ -24,99 +20,279 @@ import {
   type LiveMatch,
   type ResultMatch,
   type Tournament,
+  type Player,
+  type SurfaceKey,
+  type FormResult,
 } from "./tennis-data"
 
 /* --------------------------- PUBLIC RESPONSE TYPES ------------------------- */
 
 export type ConnectionState = "connecting" | "connected" | "error"
 
-// Normalised payload every screen consumes. Keep this stable — it is the
-// contract the UI depends on regardless of which provider is behind it.
 export type TennisFeed = {
   live: Tournament<LiveMatch>[]
   preMatch: Tournament<Match>[]
   results: Tournament<ResultMatch>[]
   aiAccuracy: { pct: number; sample: number }
-  /** ISO timestamp of when the feed was produced, useful for "last updated" UI. */
   updatedAt: string
+  /** True when values came from the bundled mock fallback rather than the live API. */
+  isMock?: boolean
 }
 
 /* ----------------------- RAW PROVIDER RESPONSE TYPES ----------------------- */
 /**
- * Loose shapes that mirror common tennis APIs. These intentionally use
- * `unknown`/optional fields so you can paste a real response in without the
- * compiler fighting you, then narrow inside `mapProviderResponse`.
+ * Loose shapes mirroring the MatchStat feed. Fields are optional / permissive
+ * on purpose — real rows vary by tour and match state, so `mapProviderResponse`
+ * reads them through defensive getters rather than trusting a fixed schema.
  */
-export type ProviderPlayer = {
-  id?: string | number
-  name: string
-  country_code?: string
-  ranking?: number
-  seed?: number
-  [key: string]: unknown
-}
-
 export type ProviderEvent = {
-  id: string | number
-  status?: string // "live" | "notstarted" | "finished" | provider-specific
+  id?: string | number
+  status?: string
   scheduled?: string
+  date?: string
+  time?: string
+  round?: string
   surface?: string
+  court_surface?: string
+  league?: string
   tournament?: string
-  home: ProviderPlayer
-  away: ProviderPlayer
-  scores?: unknown
-  odds?: { home?: number; away?: number }
+  tour?: string
+  tourType?: string
+  // player names show up under several keys depending on endpoint
+  participant1?: string
+  participant2?: string
+  home_player?: string
+  away_player?: string
+  player1?: string
+  player2?: string
+  score?: string
+  points?: { p1?: string; p2?: string } | string
+  indicator?: number | string // which player is serving
+  odds?: { p1?: number; p2?: number; home?: number; away?: number }
   [key: string]: unknown
 }
 
-export type ProviderResponse = {
-  events: ProviderEvent[]
-  [key: string]: unknown
+/** Shape returned by our own /api/matches route. */
+export type MatchesApiResponse = {
+  ok: boolean
+  updatedAt?: string
+  live?: unknown
+  schedule?: unknown
+  error?: string
+  liveError?: string | null
+  scheduleError?: string | null
+}
+
+export type ProviderResponse = MatchesApiResponse
+
+/* ------------------------------- HELPERS ----------------------------------- */
+
+function toArray(value: unknown): ProviderEvent[] {
+  if (Array.isArray(value)) return value as ProviderEvent[]
+  if (value && typeof value === "object") {
+    // Some endpoints wrap rows under a data/results/events/matches key.
+    for (const k of ["data", "results", "events", "matches", "fixtures"]) {
+      const inner = (value as Record<string, unknown>)[k]
+      if (Array.isArray(inner)) return inner as ProviderEvent[]
+    }
+  }
+  return []
+}
+
+const first = (...vals: (string | undefined)[]) => vals.find((v) => v && v.trim().length > 0)?.trim()
+
+function playerNames(e: ProviderEvent): [string, string] {
+  const p1 = first(e.participant1, e.home_player, e.player1) ?? "Player 1"
+  const p2 = first(e.participant2, e.away_player, e.player2) ?? "Player 2"
+  return [p1, p2]
+}
+
+function normSurface(e: ProviderEvent): SurfaceKey {
+  const s = (first(e.surface, e.court_surface) ?? "").toLowerCase()
+  if (s.includes("clay")) return "Clay"
+  if (s.includes("grass")) return "Grass"
+  return "Hard"
+}
+
+function tourCategory(e: ProviderEvent): "ATP" | "WTA" {
+  const t = (first(e.tour, e.tourType) ?? "").toLowerCase()
+  return t === "wta" ? "WTA" : "ATP"
+}
+
+function eventStatus(e: ProviderEvent): "live" | "finished" | "upcoming" {
+  const s = (e.status ?? "").toString().toLowerCase()
+  if (/(inplay|live|in progress|playing)/.test(s)) return "live"
+  if (/(finished|ended|complete|final|retired|walkover)/.test(s)) return "finished"
+  return "upcoming"
+}
+
+/** Build a minimal-but-valid Player when the feed lacks deep stats. */
+function stubPlayer(name: string, surface: SurfaceKey, rank: number): Player {
+  const evenStats = { winRate: 50, yearRecord: { wins: 0, losses: 0 } }
+  return {
+    name,
+    country: "—",
+    rank,
+    form: [] as FormResult[],
+    formMatches: [],
+    surfaceStats: { Hard: evenStats, Clay: evenStats, Grass: evenStats },
+  }
+}
+
+/** Parse a MatchStat score string like "6-4,2-3" into set objects. */
+function parseSets(score: string | undefined) {
+  if (!score) return [] as { p1: number; p2: number }[]
+  return score
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => {
+      const [a, b] = s.split("-").map((n) => Number.parseInt(n, 10))
+      return { p1: Number.isFinite(a) ? a : 0, p2: Number.isFinite(b) ? b : 0 }
+    })
+}
+
+function baseMatch(e: ProviderEvent, idx: number): Match {
+  const surface = normSurface(e)
+  const [n1, n2] = playerNames(e)
+  const p1 = stubPlayer(n1, surface, 1)
+  const p2 = stubPlayer(n2, surface, 2)
+  const odds = {
+    p1: e.odds?.p1 ?? e.odds?.home ?? 0,
+    p2: e.odds?.p2 ?? e.odds?.away ?? 0,
+  }
+  const favouredP1 = odds.p1 > 0 && odds.p2 > 0 ? odds.p1 <= odds.p2 : true
+  return {
+    id: String(e.id ?? `m-${idx}`),
+    time: first(e.time, e.scheduled, e.date) ?? "",
+    surface,
+    p1,
+    p2,
+    odds,
+    h2h: { p1Wins: 0, p2Wins: 0, matches: [] },
+    ai: {
+      predictedWinner: favouredP1 ? n1 : n2,
+      winProbability: 50,
+      summary: "Live API-аас статистик татагдаж байна. H2H болон форм мэдээлэл шинэчлэгдэнэ.",
+      keyFactors: ["Live өгөгдөл", "Статистик хүлээгдэж байна"],
+    },
+  }
+}
+
+/** Group flat matches into tournaments keyed by league name. */
+function groupByTournament<T extends { surface: SurfaceKey }>(
+  rows: { event: ProviderEvent; match: T }[],
+  suffix: string,
+): Tournament<T>[] {
+  const map = new Map<string, Tournament<T>>()
+  for (const { event, match } of rows) {
+    const name = first(event.league, event.tournament) ?? "Тэмцээн"
+    const category = tourCategory(event)
+    const key = `${name}-${category}`
+    if (!map.has(key)) {
+      map.set(key, { id: `${key}-${suffix}`, name, surface: match.surface, category, matches: [] })
+    }
+    map.get(key)!.matches.push(match)
+  }
+  return Array.from(map.values())
 }
 
 /* ------------------------------- ADAPTER ----------------------------------- */
-/**
- * Turn a raw provider response into the normalised `TennisFeed`.
- *
- * Not yet implemented — while running on mock data this is never called.
- * When you wire a real API, fill this in (map surfaces, split events by
- * status into live / pre-match / results, group by tournament) and delete
- * the `throw`.
- */
-export function mapProviderResponse(_raw: ProviderResponse): TennisFeed {
-  throw new Error("mapProviderResponse: implement this for your tennis provider before going live.")
+
+export function mapProviderResponse(raw: ProviderResponse): TennisFeed {
+  const liveEvents = toArray(raw.live)
+  const scheduleEvents = toArray(raw.schedule)
+
+  const liveRows: { event: ProviderEvent; match: LiveMatch }[] = []
+  const resultRows: { event: ProviderEvent; match: ResultMatch }[] = []
+  const preRows: { event: ProviderEvent; match: Match }[] = []
+
+  // Live endpoint can contain in-play, just-finished, and upcoming rows.
+  liveEvents.forEach((e, i) => {
+    const base = baseMatch(e, i)
+    const sets = parseSets(typeof e.score === "string" ? e.score : undefined)
+    const status = eventStatus(e)
+    const server = (Number(e.indicator) === 2 ? 2 : 1) as 1 | 2
+    const points = typeof e.points === "object" && e.points ? e.points : undefined
+
+    if (status === "finished") {
+      const p1Sets = sets.filter((s) => s.p1 > s.p2).length
+      resultRows.push({
+        event: e,
+        match: { ...base, sets, winner: p1Sets >= sets.length - p1Sets ? 1 : 2, aiCorrect: false, duration: "" },
+      })
+    } else {
+      liveRows.push({
+        event: e,
+        match: {
+          ...base,
+          server,
+          currentSet: Math.max(1, sets.length),
+          sets,
+          gameScore: { p1: points?.p1 ?? "0", p2: points?.p2 ?? "0" },
+          status: base.time ? `Live · ${base.time}` : "Live",
+        },
+      })
+    }
+  })
+
+  // Fixtures endpoint = upcoming pre-match list.
+  scheduleEvents.forEach((e, i) => {
+    preRows.push({ event: e, match: baseMatch(e, i) })
+  })
+
+  const feed: TennisFeed = {
+    live: groupByTournament(liveRows, "live"),
+    results: groupByTournament(resultRows, "res"),
+    preMatch: groupByTournament(preRows, "pm"),
+    aiAccuracy: mockAiAccuracy,
+    updatedAt: raw.updatedAt ?? new Date().toISOString(),
+  }
+  return feed
 }
 
-/* ------------------------------ MOCK BACKEND ------------------------------- */
+/* ------------------------------- FETCHERS ---------------------------------- */
 
-const NETWORK_DELAY = 700 // ms — makes skeletons/loading states observable
+const isEmpty = (f: TennisFeed) => !f.live.length && !f.preMatch.length && !f.results.length
 
-function delay<T>(value: T, ms = NETWORK_DELAY): Promise<T> {
-  return new Promise((resolve) => setTimeout(() => resolve(value), ms))
-}
-
-/**
- * Fetch the full feed (pre-match, live, results).
- *
- * REAL API version would look roughly like:
- *   const res = await fetch("/api/tennis/feed")       // server route holds the key
- *   if (!res.ok) throw new Error("Feed request failed")
- *   return mapProviderResponse(await res.json())
- */
-export async function fetchTennisData(): Promise<TennisFeed> {
-  return delay({
+function mockFeed(): TennisFeed {
+  return {
     live: mockLiveMatches,
     preMatch: mockPreMatch,
     results: mockResults,
     aiAccuracy: mockAiAccuracy,
     updatedAt: new Date().toISOString(),
-  })
+    isMock: true,
+  }
+}
+
+async function getJson(url: string): Promise<MatchesApiResponse | null> {
+  try {
+    const res = await fetch(url, { cache: "no-store" })
+    const json = (await res.json()) as MatchesApiResponse
+    if (!res.ok || !json.ok) return null
+    return json
+  } catch {
+    return null
+  }
 }
 
 /**
- * Fetch only the live board. Split out so the UI can poll live scores on a
- * tight interval without re-pulling pre-match/results.
+ * Full feed for the dashboard. Hits the server route; if the live provider is
+ * unavailable or returns nothing usable, falls back to mock data so the UI
+ * still renders. `isMock` on the result lets the UI decide how to badge it.
  */
+export async function fetchTennisData(): Promise<TennisFeed> {
+  const json = await getJson("/api/matches")
+  if (!json) return mockFeed()
+  const feed = mapProviderResponse(json)
+  return isEmpty(feed) ? mockFeed() : feed
+}
+
+/** Live board only, for tight polling. */
 export async function fetchLiveData(): Promise<{ live: Tournament<LiveMatch>[]; updatedAt: string }> {
-  return delay({ live: mockLiveMatches, updatedAt: new Date().toISOString() }, 500)
+  const json = await getJson("/api/matches?type=live")
+  if (!json) return { live: mockFeed().live, updatedAt: new Date().toISOString() }
+  const feed = mapProviderResponse({ ok: true, live: json.live, updatedAt: json.updatedAt })
+  return { live: feed.live.length ? feed.live : mockFeed().live, updatedAt: feed.updatedAt }
 }
