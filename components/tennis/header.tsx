@@ -2,7 +2,8 @@
 
 import { Search, ChevronLeft, ChevronRight, Target } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { dateOptions, surfaceFilters, aiAccuracy, type SurfaceKey } from "@/lib/tennis-data"
+import { dateOptions, surfaceFilters, type SurfaceKey } from "@/lib/tennis-data"
+import type { ConnectionState } from "@/lib/tennis-api"
 
 export type TabKey = "pre" | "live" | "results"
 
@@ -22,6 +23,8 @@ export function Header({
   liveCount,
   surface,
   onSurfaceChange,
+  connection,
+  aiAccuracy,
 }: {
   activeTab: TabKey
   onTabChange: (t: TabKey) => void
@@ -32,6 +35,8 @@ export function Header({
   liveCount: number
   surface: "all" | SurfaceKey
   onSurfaceChange: (s: "all" | SurfaceKey) => void
+  connection: ConnectionState
+  aiAccuracy: { pct: number; sample: number }
 }) {
   const dateIndex = dateOptions.indexOf(activeDate as (typeof dateOptions)[number])
 
@@ -48,8 +53,14 @@ export function Header({
           <Target className="h-3.5 w-3.5 shrink-0 text-primary" />
           <p className="text-[11px] font-medium text-foreground sm:text-xs">
             AI Таамаглалын оновч:{" "}
-            <span className="font-mono font-bold text-primary">{aiAccuracy.pct}%</span>{" "}
-            <span className="text-muted-foreground">(Сүүлийн {aiAccuracy.sample} тоглолт)</span>
+            {connection === "connecting" ? (
+              <span className="inline-block h-3 w-10 animate-pulse rounded bg-primary/30 align-middle" />
+            ) : (
+              <>
+                <span className="font-mono font-bold text-primary">{aiAccuracy.pct}%</span>{" "}
+                <span className="text-muted-foreground">(Сүүлийн {aiAccuracy.sample} тоглолт)</span>
+              </>
+            )}
           </p>
         </div>
       </div>
@@ -63,6 +74,7 @@ export function Header({
           <span className="text-base font-bold tracking-tight">
             TennisScore<span className="text-primary"> AI</span>
           </span>
+          <ConnectionBadge connection={connection} />
         </div>
 
         <div className="relative w-40 sm:w-56">
@@ -156,6 +168,47 @@ export function Header({
         </div>
       </div>
     </header>
+  )
+}
+
+function ConnectionBadge({ connection }: { connection: ConnectionState }) {
+  const config = {
+    connected: {
+      label: "Live API холбогдсон",
+      dot: "bg-success",
+      text: "text-success",
+      bg: "bg-success/10 border-success/30",
+      pulse: true,
+    },
+    connecting: {
+      label: "Холбогдож байна…",
+      dot: "bg-chart-3",
+      text: "text-chart-3",
+      bg: "bg-chart-3/10 border-chart-3/30",
+      pulse: true,
+    },
+    error: {
+      label: "API холболт тасарсан",
+      dot: "bg-destructive",
+      text: "text-destructive",
+      bg: "bg-destructive/10 border-destructive/30",
+      pulse: false,
+    },
+  }[connection]
+
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      className={cn(
+        "hidden items-center gap-1.5 rounded-full border px-2 py-0.5 text-[10px] font-semibold sm:inline-flex",
+        config.bg,
+        config.text,
+      )}
+    >
+      <span className={cn("h-1.5 w-1.5 rounded-full", config.dot, config.pulse && "live-dot")} />
+      {config.label}
+    </span>
   )
 }
 
